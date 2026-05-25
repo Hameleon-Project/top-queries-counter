@@ -1,8 +1,13 @@
 package app
 
 import (
+	"encoding/json"
+	"log"
 	"sync"
+
 	"top-queries-counter/internal/store"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type SearchEvent struct {
@@ -22,6 +27,65 @@ func NewProcessor(s *store.Storage) *Processor {
 	return &Processor{
 		store:    s,
 		antiSpam: make(map[string]int64),
+	}
+}
+
+func (p *Processor) ListenRabbit(amqpURL, queueName string, stopChan chan struct{}) {
+	conn, err := amqp.Dial(amqpURL)
+	if err != nil {
+		log.Fatalf("failed to connect to rabbitmq: %v", err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("failed to open a channel: %v", err)
+	}
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare(
+		queueName,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("failed to declare a queue: %v", err)
+	}
+
+	msgs, err := ch.Consume(
+		q.Name,
+		"",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("failed to register a consumer: %v", err)
+	}
+
+	log.Printf("Started RabbitMQ consumer on queue: %s", queueName)
+
+	for {
+		select {
+		case d := <-msgs:
+			if len(d.Body) == 0 {
+				continue
+			}
+			var ev SearchEvent
+			if err := json.Unmarshal(d.Body, &ev); err != nil {
+				log.Printf("failed to unmarshal amqp message: %v", err)
+				continue
+			}
+			p.Process(ev)
+		case <-stopChan:
+			log.Println("Stopping RabbitMQ consumer gracefully...")
+			return
+		}
 	}
 }
 
