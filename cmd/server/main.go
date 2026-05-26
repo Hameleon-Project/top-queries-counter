@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"top-queries-counter/internal/antispam"
 	"top-queries-counter/internal/api"
 	"top-queries-counter/internal/app"
 	"top-queries-counter/internal/config"
@@ -20,9 +21,10 @@ func main() {
 
 	cfg := config.Load()
 	s := store.New()
-	p := app.NewProcessor(s)
+	guard := antispam.New(cfg.AntispamUserCooldown, cfg.AntispamMaxPerIPMin, cfg.AntispamMaxQueryMin)
+	p := app.NewProcessor(s, guard)
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	go func() {
 		for range ticker.C {
@@ -31,33 +33,31 @@ func main() {
 	}()
 
 	stopRabbit := make(chan struct{})
-	go p.ListenRabbit(cfg.AMQPURL, "search_logs", stopRabbit)
+	go p.ListenRabbit(cfg.AMQPURL, cfg.QueueName, stopRabbit)
 
-	handler := api.NewHandler(s)
 	srv := &http.Server{
 		Addr:    cfg.HTTPAddr,
-		Handler: *handler,
+		Handler: api.NewHandler(s, cfg.MaxTopN),
 	}
 
 	go func() {
-		log.Printf("HTTP Server running on %s\n", cfg.HTTPAddr)
+		log.Printf("HTTP server listening on %s", cfg.HTTPAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("failed to listen: %v", err)
+			log.Fatalf("HTTP server error: %v", err)
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("Shutting down server...")
+	log.Println("Shutting down...")
 
 	close(stopRabbit)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
+		log.Fatalf("HTTP shutdown error: %v", err)
 	}
-
-	log.Println("Service exiting gracefully")
+	log.Println("Service stopped")
 }

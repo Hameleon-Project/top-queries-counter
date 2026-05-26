@@ -5,7 +5,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o main ./cmd/server/main.go
 
-FROM alpine:latest
+FROM alpine:3.20
+RUN apk add --no-cache wget
 WORKDIR /root/
 COPY --from=builder /app/main .
 EXPOSE 8080

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   rabbitmq:
     image: rabbitmq:3-management
@@ -11,7 +9,7 @@ services:
       test: ["CMD", "rabbitmq-diagnostics", "check_running"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   search-service:
     build: .
@@ -19,8 +17,16 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - HTTP_ADDR=:8080
-      - AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      HTTP_ADDR: ":8080"
+      AMQP_URL: "amqp://guest:guest@rabbitmq:5672/"
+      QUEUE_NAME: "search_logs"
     depends_on:
       rabbitmq:
         condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s

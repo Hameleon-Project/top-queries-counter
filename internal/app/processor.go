@@ -3,8 +3,10 @@ package app
 import (
 	"encoding/json"
 	"log"
-	"sync"
+	"time"
 
+	"top-queries-counter/internal/antispam"
+	"top-queries-counter/internal/metrics"
 	"top-queries-counter/internal/store"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -17,105 +19,121 @@ type SearchEvent struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+const windowSeconds = 300
+
 type Processor struct {
-	store    *store.Storage
-	mu       sync.Mutex
-	antiSpam map[string]int64
+	store *store.Storage
+	guard *antispam.Guard
 }
 
-func NewProcessor(s *store.Storage) *Processor {
-	return &Processor{
-		store:    s,
-		antiSpam: make(map[string]int64),
+func NewProcessor(s *store.Storage, guard *antispam.Guard) *Processor {
+	return &Processor{store: s, guard: guard}
+}
+
+func (p *Processor) ListenRabbit(amqpURL, queueName string, stopChan <-chan struct{}) {
+	backoff := 2 * time.Second
+	for {
+		select {
+		case <-stopChan:
+			log.Println("Stopping RabbitMQ consumer...")
+			return
+		default:
+		}
+
+		err := p.consume(amqpURL, queueName, stopChan)
+		if err == nil {
+			return
+		}
+		log.Printf("RabbitMQ consumer stopped: %v", err)
+
+		select {
+		case <-stopChan:
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
 	}
 }
 
-func (p *Processor) ListenRabbit(amqpURL, queueName string, stopChan chan struct{}) {
+func (p *Processor) consume(amqpURL, queueName string, stopChan <-chan struct{}) error {
 	conn, err := amqp.Dial(amqpURL)
 	if err != nil {
-		log.Fatalf("failed to connect to rabbitmq: %v", err)
+		return err
 	}
 	defer conn.Close()
 
 	ch, err := conn.Channel()
 	if err != nil {
-		log.Fatalf("failed to open a channel: %v", err)
+		return err
 	}
 	defer ch.Close()
 
-	q, err := ch.QueueDeclare(
-		queueName,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
+	q, err := ch.QueueDeclare(queueName, true, false, false, false, nil)
 	if err != nil {
-		log.Fatalf("failed to declare a queue: %v", err)
+		return err
 	}
 
-	msgs, err := ch.Consume(
-		q.Name,
-		"",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
+	msgs, err := ch.Consume(q.Name, "", true, false, false, false, nil)
 	if err != nil {
-		log.Fatalf("failed to register a consumer: %v", err)
+		return err
 	}
 
-	log.Printf("Started RabbitMQ consumer on queue: %s", queueName)
+	log.Printf("RabbitMQ consumer connected, queue=%s", queueName)
 
 	for {
 		select {
-		case d := <-msgs:
+		case <-stopChan:
+			return nil
+		case d, ok := <-msgs:
+			if !ok {
+				return amqp.ErrClosed
+			}
 			if len(d.Body) == 0 {
 				continue
 			}
 			var ev SearchEvent
 			if err := json.Unmarshal(d.Body, &ev); err != nil {
-				log.Printf("failed to unmarshal amqp message: %v", err)
+				log.Printf("invalid message JSON: %v", err)
+				metrics.EventsDropped.Inc()
 				continue
 			}
 			p.Process(ev)
-		case <-stopChan:
-			log.Println("Stopping RabbitMQ consumer gracefully...")
-			return
 		}
 	}
 }
 
 func (p *Processor) Process(ev SearchEvent) {
-	if ev.Query == "" {
+	query := store.NormalizeQuery(ev.Query)
+	if query == "" {
+		metrics.EventsDropped.Inc()
+		return
+	}
+
+	ts := ev.Timestamp
+	if ts == 0 {
+		ts = time.Now().Unix()
+	}
+
+	now := time.Now().Unix()
+	if ts < now-windowSeconds || ts > now+60 {
+		metrics.EventsDropped.Inc()
 		return
 	}
 
 	userID := ev.UserID
-	if userID == "" {
-		userID = ev.IP
-	}
-	key := userID + ":" + ev.Query
-
-	p.mu.Lock()
-	lastTime, exists := p.antiSpam[key]
-	if exists && ev.Timestamp-lastTime < 5 {
-		p.mu.Unlock()
+	ip := ev.IP
+	if userID == "" && ip == "" {
+		metrics.EventsDropped.Inc()
 		return
 	}
-	p.antiSpam[key] = ev.Timestamp
 
-	if len(p.antiSpam) > 50000 {
-		for k, ts := range p.antiSpam {
-			if ev.Timestamp-ts > 10 {
-				delete(p.antiSpam, k)
-			}
-		}
+	if !p.guard.Allow(userID, query, ip, ts) {
+		metrics.EventsDropped.Inc()
+		return
 	}
-	p.mu.Unlock()
 
-	p.store.Add(ev.Query, ev.Timestamp)
+	p.store.Add(query, ts)
+	metrics.EventsProcessed.Inc()
 }

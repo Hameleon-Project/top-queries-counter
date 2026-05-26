@@ -2,9 +2,12 @@ package store
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
+
+const WindowSeconds = 300
 
 type Item struct {
 	Query string `json:"query"`
@@ -30,7 +33,12 @@ func New() *Storage {
 	}
 }
 
+func NormalizeQuery(query string) string {
+	return strings.TrimSpace(strings.ToLower(query))
+}
+
 func (s *Storage) IsStopWord(query string) bool {
+	query = NormalizeQuery(query)
 	s.stopMu.RLock()
 	defer s.stopMu.RUnlock()
 	_, exists := s.stopWords[query]
@@ -38,19 +46,45 @@ func (s *Storage) IsStopWord(query string) bool {
 }
 
 func (s *Storage) AddStopWord(word string) {
+	word = NormalizeQuery(word)
+	if word == "" {
+		return
+	}
 	s.stopMu.Lock()
 	s.stopWords[word] = struct{}{}
 	s.stopMu.Unlock()
+	s.PurgeQuery(word)
 }
 
 func (s *Storage) RemoveStopWord(word string) {
+	word = NormalizeQuery(word)
 	s.stopMu.Lock()
 	delete(s.stopWords, word)
 	s.stopMu.Unlock()
 }
 
+func (s *Storage) ListStopWords() []string {
+	s.stopMu.RLock()
+	defer s.stopMu.RUnlock()
+	out := make([]string, 0, len(s.stopWords))
+	for w := range s.stopWords {
+		out = append(out, w)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *Storage) PurgeQuery(query string) {
+	query = NormalizeQuery(query)
+	s.mu.Lock()
+	delete(s.history, query)
+	s.mu.Unlock()
+	s.UpdateCache()
+}
+
 func (s *Storage) Add(query string, timestamp int64) {
-	if s.IsStopWord(query) {
+	query = NormalizeQuery(query)
+	if query == "" || s.IsStopWord(query) {
 		return
 	}
 
@@ -61,10 +95,15 @@ func (s *Storage) Add(query string, timestamp int64) {
 
 func (s *Storage) UpdateCache() {
 	s.mu.Lock()
-	boundary := time.Now().Unix() - 300
-	var list []Item
+	boundary := time.Now().Unix() - WindowSeconds
+	list := make([]Item, 0, len(s.history))
 
 	for query, timestamps := range s.history {
+		if s.IsStopWord(query) {
+			delete(s.history, query)
+			continue
+		}
+
 		validIdx := 0
 		for _, ts := range timestamps {
 			if ts >= boundary {
@@ -75,10 +114,7 @@ func (s *Storage) UpdateCache() {
 		s.history[query] = timestamps[:validIdx]
 
 		if validIdx > 0 {
-			list = append(list, Item{
-				Query: query,
-				Count: validIdx,
-			})
+			list = append(list, Item{Query: query, Count: validIdx})
 		} else {
 			delete(s.history, query)
 		}
@@ -97,19 +133,27 @@ func (s *Storage) UpdateCache() {
 	s.cacheMu.Unlock()
 }
 
-func (s *Storage) GetCachedTop(limit int) []Item {
+func (s *Storage) TopQueries(limit int) []Item {
+	if limit <= 0 {
+		limit = 10
+	}
+
 	s.cacheMu.RLock()
 	defer s.cacheMu.RUnlock()
 
 	if len(s.cache) == 0 {
 		return []Item{}
 	}
-
-	if len(s.cache) > limit {
-		return s.cache[:limit]
+	if len(s.cache) <= limit {
+		out := make([]Item, len(s.cache))
+		copy(out, s.cache)
+		return out
 	}
+	out := make([]Item, limit)
+	copy(out, s.cache[:limit])
+	return out
+}
 
-	res := make([]Item, len(s.cache))
-	copy(res, s.cache)
-	return res
+func (s *Storage) Top(limit int) []Item {
+	return s.TopQueries(limit)
 }
